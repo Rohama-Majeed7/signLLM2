@@ -35,6 +35,6 @@ class Config:
     llm_model = "decapoda-research/llama-7b-hf"  # Or use smaller model for Kaggle
     
     # Dataset paths (Kaggle specific)
-    data_root = "/kaggle/input/phoenix2014t"
+    data_root = "/kaggle/input/phoenixweather2014t-3rd-attempt"
     
 config = Config()
