@@ -8,7 +8,7 @@ from tqdm import tqdm
 import argparse
 import wandb
 
-from config.config import Config
+from configs.config import Config
 from data.phoenix_dataset import PhoenixDataset
 from models.signllm import SignLLM
 
