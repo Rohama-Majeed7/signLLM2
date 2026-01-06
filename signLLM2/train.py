@@ -1,5 +1,5 @@
 """
-Training script with memory optimizations
+Training script - Fixed key error
 """
 import os
 import sys
@@ -43,11 +43,13 @@ def create_datasets(config):
     print(f"\n📁 LOADING DATASETS (Limited samples):")
     
     datasets = {}
-    for split, max_samples in [
+    split_configs = [
         (config.train_split, config.max_train_samples),
         (config.val_split, config.max_val_samples),
         (config.test_split, config.max_test_samples)
-    ]:
+    ]
+    
+    for split, max_samples in split_configs:
         print(f"  Loading {split} split...")
         dataset = PhoenixDataset(
             config.data_root,
@@ -58,7 +60,8 @@ def create_datasets(config):
         datasets[split] = dataset
         print(f"    Loaded {len(dataset)} samples")
     
-    return datasets['train'], datasets['val'], datasets['test']
+    # Return datasets using the actual split names
+    return datasets[config.train_split], datasets[config.val_split], datasets[config.test_split]
 
 def train_epoch(model, dataloader, optimizer, epoch, config):
     """Train for one epoch with gradient accumulation"""
@@ -152,13 +155,18 @@ def main():
     # Create datasets with limited samples
     train_dataset, val_dataset, test_dataset = create_datasets(config)
     
+    print(f"\n📈 DATASET STATS:")
+    print(f"  Training samples: {len(train_dataset)}")
+    print(f"  Validation samples: {len(val_dataset)}")
+    print(f"  Test samples: {len(test_dataset)}")
+    
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=0,
-        pin_memory=False  # Disable for CPU
+        pin_memory=False
     )
     
     val_loader = DataLoader(
