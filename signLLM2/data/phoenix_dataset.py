@@ -1,5 +1,5 @@
 """
-Phoenix-2014T Dataset Loader for the specific dataset structure
+Phoenix-2014T Dataset Loader - Fixed annotation loading
 """
 import os
 import torch
@@ -10,7 +10,7 @@ import pandas as pd
 import gzip
 
 class PhoenixDataset(Dataset):
-    def __init__(self, data_root, split='train', transform=None, config=None):
+    def __init__(self, data_root, split='train', transform=None, config=None, max_samples=None):
         self.data_root = data_root
         self.split = split
         self.transform = transform
@@ -20,63 +20,26 @@ class PhoenixDataset(Dataset):
         self.videos_dir = os.path.join(config.videos_dir, split) if config else \
                          os.path.join(data_root, "videos_phoenix/videos", split)
         
-        # Load annotations
-        self.annotations = self._load_annotations()
-        
-        # Get video files
-        self.video_files = []
-        self.texts = []
-        
-        # Load from annotations
-        if self.annotations is not None:
-            print(f"Loading {len(self.annotations)} samples from annotations...")
-            for idx, row in self.annotations.iterrows():
-                video_file = f"{row['name']}.mp4"
-                video_path = os.path.join(self.videos_dir, video_file)
-                
-                if os.path.exists(video_path):
-                    self.video_files.append(video_path)
-                    self.texts.append(row['translation'])
-                else:
-                    # Try alternative naming
-                    alt_files = [f for f in os.listdir(self.videos_dir) 
-                                if row['name'] in f and f.endswith('.mp4')]
-                    if alt_files:
-                        video_path = os.path.join(self.videos_dir, alt_files[0])
-                        self.video_files.append(video_path)
-                        self.texts.append(row['translation'])
-        
-        # If no annotations loaded, use all videos in directory
-        if len(self.video_files) == 0:
-            print("Loading videos directly from directory...")
-            for video_file in os.listdir(self.videos_dir):
-                if video_file.endswith('.mp4'):
-                    self.video_files.append(os.path.join(self.videos_dir, video_file))
-                    self.texts.append(f"Video: {video_file}")
+        # Load video-text pairs
+        self.video_files, self.texts = self._load_data(max_samples)
         
         print(f"✅ Phoenix-2014T {split} dataset loaded: {len(self)} videos")
     
-    def _load_annotations(self):
-        """Load annotations from gzip files"""
-        annotation_files = {
-            'train': 'phoenix14t.pami0.train.annotations_only.gzip',
-            'dev': 'phoenix14t.pami0.dev.annotations_only.gzip',
-            'test': 'phoenix14t.pami0.test.annotations_only.gzip'
-        }
-        
-        if self.split in annotation_files:
-            anno_path = os.path.join(self.config.annotations_dir, annotation_files[self.split])
+    def _load_annotations_binary(self, anno_path):
+        """Load annotations from binary gzip file"""
+        try:
+            # Read binary file
+            with gzip.open(anno_path, 'rb') as f:
+                content = f.read()
             
-            if os.path.exists(anno_path):
+            # Try to decode with different encodings
+            encodings = ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252']
+            
+            for encoding in encodings:
                 try:
-                    print(f"Loading annotations from: {anno_path}")
+                    text = content.decode(encoding)
+                    lines = text.strip().split('\n')
                     
-                    # Read gzip file
-                    with gzip.open(anno_path, 'rt', encoding='utf-8') as f:
-                        # Phoenix annotations are tab-separated
-                        lines = f.readlines()
-                        
-                    # Parse annotations
                     data = []
                     for line in lines:
                         parts = line.strip().split('\t')
@@ -85,12 +48,108 @@ class PhoenixDataset(Dataset):
                             translation = parts[1]
                             data.append({'name': name, 'translation': translation})
                     
+                    print(f"Successfully decoded with {encoding}")
                     return pd.DataFrame(data)
                     
-                except Exception as e:
-                    print(f"Error loading annotations: {e}")
+                except UnicodeDecodeError:
+                    continue
+            
+            print(f"Could not decode with any encoding, trying raw parsing...")
+            
+            # If all encodings fail, try raw parsing
+            lines = content.split(b'\n')
+            data = []
+            for line in lines:
+                if line:
+                    parts = line.split(b'\t')
+                    if len(parts) >= 2:
+                        try:
+                            name = parts[0].decode('utf-8', errors='ignore')
+                            translation = parts[1].decode('utf-8', errors='ignore')
+                            data.append({'name': name, 'translation': translation})
+                        except:
+                            continue
+            
+            return pd.DataFrame(data)
+            
+        except Exception as e:
+            print(f"Error loading annotations from {anno_path}: {e}")
+            return None
+    
+    def _load_data(self, max_samples=None):
+        """Load video files and texts"""
+        video_files = []
+        texts = []
         
-        return None
+        # Try to load annotations first
+        annotation_files = {
+            'train': 'phoenix14t.pami0.train.annotations_only.gzip',
+            'dev': 'phoenix14t.pami0.dev.annotations_only.gzip',
+            'test': 'phoenix14t.pami0.test.annotations_only.gzip'
+        }
+        
+        if self.split in annotation_files:
+            anno_path = os.path.join(self.config.data_root, annotation_files[self.split])
+            
+            if os.path.exists(anno_path):
+                print(f"Loading annotations from: {anno_path}")
+                annotations = self._load_annotations_binary(anno_path)
+                
+                if annotations is not None and not annotations.empty:
+                    print(f"Loaded {len(annotations)} annotations")
+                    
+                    for idx, row in annotations.iterrows():
+                        if max_samples and len(video_files) >= max_samples:
+                            break
+                        
+                        video_name = row['name']
+                        # Try different video extensions and naming patterns
+                        video_patterns = [
+                            f"{video_name}.mp4",
+                            f"{video_name}.avi",
+                            video_name  # Sometimes the name includes extension
+                        ]
+                        
+                        for pattern in video_patterns:
+                            video_path = os.path.join(self.videos_dir, pattern)
+                            if os.path.exists(video_path):
+                                video_files.append(video_path)
+                                texts.append(row['translation'])
+                                break
+                        else:
+                            # Try to find any file containing the video name
+                            if os.path.exists(self.videos_dir):
+                                for file in os.listdir(self.videos_dir):
+                                    if video_name in file and file.endswith('.mp4'):
+                                        video_path = os.path.join(self.videos_dir, file)
+                                        video_files.append(video_path)
+                                        texts.append(row['translation'])
+                                        break
+        
+        # If no annotations loaded or not enough videos, load directly
+        if len(video_files) == 0:
+            print("Loading videos directly from directory...")
+            if os.path.exists(self.videos_dir):
+                all_videos = []
+                for file in os.listdir(self.videos_dir):
+                    if file.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+                        all_videos.append(file)
+                
+                # Sort for reproducibility
+                all_videos.sort()
+                
+                # Limit samples if specified
+                if max_samples:
+                    all_videos = all_videos[:max_samples]
+                
+                for video_file in all_videos:
+                    video_path = os.path.join(self.videos_dir, video_file)
+                    video_files.append(video_path)
+                    # Create descriptive text from filename
+                    text = f"Sign language video: {os.path.splitext(video_file)[0]}"
+                    texts.append(text)
+        
+        return video_files, texts
     
     def _load_video(self, video_path):
         """Load and preprocess video"""
@@ -104,8 +163,8 @@ class PhoenixDataset(Dataset):
             fps = cap.get(cv2.CAP_PROP_FPS)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             
-            if total_frames == 0:
-                print(f"Warning: Video {video_path} has 0 frames")
+            if total_frames == 0 or fps == 0:
+                print(f"Warning: Video {video_path} has 0 frames or 0 fps")
                 cap.release()
                 return self._create_dummy_video()
             
@@ -123,7 +182,11 @@ class PhoenixDataset(Dataset):
                 
                 if frame_count % frame_interval == 0:
                     # Resize
-                    frame = cv2.resize(frame, self.config.img_size)
+                    if self.config:
+                        frame = cv2.resize(frame, self.config.img_size)
+                    else:
+                        frame = cv2.resize(frame, (112, 112))
+                    
                     # Convert to RGB
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     # Normalize
@@ -136,10 +199,12 @@ class PhoenixDataset(Dataset):
             
             # Handle insufficient frames
             if len(frames) < target_frames:
-                # Repeat last frame
-                last_frame = frames[-1] if frames else np.zeros((*self.config.img_size, 3), dtype=np.float32)
-                while len(frames) < target_frames:
-                    frames.append(last_frame.copy())
+                if frames:  # Pad with last frame
+                    last_frame = frames[-1]
+                    while len(frames) < target_frames:
+                        frames.append(last_frame.copy())
+                else:  # Create dummy frames
+                    return self._create_dummy_video()
             elif len(frames) > target_frames:
                 frames = frames[:target_frames]
             
@@ -157,7 +222,7 @@ class PhoenixDataset(Dataset):
         if self.config:
             C, T, H, W = 3, self.config.video_frames, self.config.img_size[0], self.config.img_size[1]
         else:
-            C, T, H, W = 3, 32, 224, 224
+            C, T, H, W = 3, 32, 112, 112
         
         return torch.randn(C, T, H, W)
     
