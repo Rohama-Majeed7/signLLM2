@@ -46,7 +46,7 @@ def inference(model, dataloader, config):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, default='/kaggle/input/phoenix2014t')
+    parser.add_argument('--data_dir', type=str, default='/kaggle/input/phoenixweather2014t-3rd-attempt')
     parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--split', type=str, default='test')
     args = parser.parse_args()
