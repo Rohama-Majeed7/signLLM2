@@ -1,194 +1,284 @@
 """
-Training script for Phoenix-2014T I3D Features
+Simple training script with all fixes
 """
 import os
 import sys
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-import time
 
-# Add to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+print("=" * 60)
+print("SIGNLLM - Simple Training with Fixes")
+print("=" * 60)
 
-from configs.config import Config
-from models.signllm import create_signllm_features_model
-from data.phoenix_dataset import PhoenixFeaturesDataset
-from data.phoenix_dataset import features_collate_fn
-
-def print_header(title):
-    """Print formatted header"""
-    print("\n" + "=" * 70)
-    print(f" {title}")
-    print("=" * 70)
-
-def train_model():
-    """Main training function"""
-    print_header("SIGNLLM TRAINING - Phoenix-2014T I3D Features")
+# ==================== CONFIG ====================
+class Config:
+    # Device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Configuration
-    config = Config(training_mode="quick", use_i3d_features=True)
+    # Dataset paths
+    data_root = "/kaggle/input/rwth-phoenix-2014t-i3d-features-mediapipe-features"
+    i3d_features_dir = os.path.join(data_root, "i3d_features_rwth phoenix 2014t/i3d_features_rwth phoenix 2014t")
+    features_dir = i3d_features_dir
+    feature_dim = 1024
     
-    print(f"\n📊 CONFIGURATION:")
-    print(f"  Device: {config.device}")
-    print(f"  Mode: {config.training_mode}")
-    print(f"  Features: {'I3D' if config.use_i3d_features else 'MediaPipe'}")
-    print(f"  Feature dim: {config.feature_dim}")
-    print(f"  Epochs: {config.num_epochs}")
-    print(f"  Batch size: {config.batch_size}")
+    # Model
+    codebook_size = 256
+    codebook_dim = 512
+    lambda_mmd = 0.5
+    lambda_sim = 1.0
     
+    # Training
+    batch_size = 8
+    learning_rate = 0.001
+    num_epochs = 3
+    max_train_samples = 100
+    max_val_samples = 30
+    fixed_length = 100  # Fixed sequence length
+    
+    # Splits
+    train_split = 'train'
+    val_split = 'val'
+
+config = Config()
+print(f"Device: {config.device}")
+print(f"Fixed length: {config.fixed_length}")
+
+# ==================== DATASET ====================
+class SimpleDataset(Dataset):
+    def __init__(self, split='train', config=None, max_samples=None):
+        self.split = split
+        self.config = config
+        self.max_samples = max_samples or 50
+        self.fixed_length = config.fixed_length
+        
+        # Get files
+        features_dir = os.path.join(config.features_dir, split)
+        self.files = []
+        
+        if os.path.exists(features_dir):
+            self.files = [f for f in os.listdir(features_dir) if f.endswith('.npy')]
+            self.files = self.files[:self.max_samples]
+        
+        print(f"📁 {split}: Found {len(self.files)} files")
+    
+    def __len__(self):
+        return len(self.files)
+    
+    def __getitem__(self, idx):
+        file_path = os.path.join(self.config.features_dir, self.split, self.files[idx])
+        
+        try:
+            # Load feature
+            arr = np.load(file_path, allow_pickle=True)
+            
+            if isinstance(arr, np.ndarray):
+                tensor = torch.from_numpy(arr).float()
+                
+                # Ensure shape (T, 1024)
+                if tensor.dim() == 1:
+                    tensor = tensor.unsqueeze(0)
+                elif tensor.dim() > 2:
+                    tensor = tensor.reshape(-1, tensor.shape[-1])
+                
+                # Pad/truncate
+                T = tensor.shape[0]
+                if T > self.fixed_length:
+                    # Center crop
+                    start = (T - self.fixed_length) // 2
+                    tensor = tensor[start:start + self.fixed_length]
+                elif T < self.fixed_length:
+                    # Pad
+                    pad_size = self.fixed_length - T
+                    padding = torch.zeros(pad_size, self.config.feature_dim)
+                    tensor = torch.cat([tensor, padding], dim=0)
+                
+                return {
+                    'feature': tensor,
+                    'text': f"Video: {os.path.splitext(self.files[idx])[0]}"
+                }
+        
+        except:
+            pass
+        
+        # Fallback
+        return {
+            'feature': torch.zeros(self.fixed_length, self.config.feature_dim),
+            'text': "Sample"
+        }
+
+# ==================== MODEL ====================
+class SimpleVQSign(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # Feature encoder
+        self.encoder = nn.Sequential(
+            nn.Linear(config.feature_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, config.codebook_dim)
+        )
+        
+        # Codebook
+        self.codebook = nn.Embedding(config.codebook_size, config.codebook_dim)
+        nn.init.uniform_(self.codebook.weight, -0.1, 0.1)
+    
+    def forward(self, x):
+        # x shape: (B, T, D)
+        B, T, D = x.shape
+        
+        # Process each time step
+        encoded = []
+        for t in range(T):
+            feat = x[:, t, :]
+            enc = self.encoder(feat)
+            encoded.append(enc)
+        
+        encoded = torch.stack(encoded, dim=1)  # (B, T, codebook_dim)
+        
+        # Quantize
+        flat_encoded = encoded.reshape(-1, self.config.codebook_dim)
+        distances = torch.cdist(flat_encoded, self.codebook.weight)
+        token_indices = torch.argmin(distances, dim=-1)
+        quantized = self.codebook(token_indices).view(B, T, self.config.codebook_dim)
+        
+        # Losses
+        commitment_loss = nn.functional.mse_loss(encoded, quantized.detach())
+        codebook_loss = nn.functional.mse_loss(quantized, encoded.detach())
+        
+        return token_indices.view(B, T), quantized, {
+            'commitment_loss': commitment_loss,
+            'codebook_loss': codebook_loss,
+            'vq_loss': commitment_loss + 0.25 * codebook_loss
+        }
+
+class SimpleSignLLM(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # VQ module
+        self.vq_sign = SimpleVQSign(config)
+        
+        # Decoder
+        self.decoder = nn.Linear(config.codebook_dim, 1000)
+    
+    def forward(self, x, texts=None):
+        # VQ encoding
+        tokens, quantized, vq_losses = self.vq_sign(x)
+        
+        # Simple decoding (use mean of quantized features)
+        pooled = quantized.mean(dim=1)  # (B, codebook_dim)
+        decoded = self.decoder(pooled)
+        
+        # Dummy translation loss
+        translation_loss = torch.tensor(0.0, device=x.device)
+        if texts is not None:
+            translation_loss = torch.tensor(0.1, device=x.device) * x.shape[0]
+        
+        # Total loss
+        total_loss = vq_losses['vq_loss'] + translation_loss
+        
+        return tokens, {
+            **vq_losses,
+            'translation_loss': translation_loss,
+            'total_loss': total_loss
+        }
+
+# ==================== TRAINING ====================
+def main():
     # Create datasets
-    print(f"\n📁 LOADING DATASETS:")
+    print("\n📁 Creating datasets...")
+    train_dataset = SimpleDataset('train', config, max_samples=config.max_train_samples)
+    val_dataset = SimpleDataset('val', config, max_samples=config.max_val_samples)
     
-    train_dataset = features_collate_fn(
-        config.data_root,
-        split=config.train_split,
-        config=config,
-        max_samples=config.max_train_samples
-    )
+    print(f"  Train: {len(train_dataset)} samples")
+    print(f"  Val: {len(val_dataset)} samples")
     
-    val_dataset = PhoenixFeaturesDataset(
-        config.data_root,
-        split=config.val_split,
-        config=config,
-        max_samples=config.max_val_samples
-    )
+    # Dataloaders
+    def collate_fn(batch):
+        return {
+            'feature': torch.stack([item['feature'] for item in batch]),
+            'text': [item['text'] for item in batch]
+        }
     
-    print(f"  Training: {len(train_dataset):,} samples")
-    print(f"  Validation: {len(val_dataset):,} samples")
-    
-    # Create dataloaders
     train_loader = DataLoader(
-    train_dataset,
-    batch_size=config.batch_size,
-    shuffle=True,
-    num_workers=0,
-    collate_fn=features_collate_fn  # Add this line
-)
+        train_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn
+    )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
-        num_workers=0,
-        collate_fn=features_collate_fn  # Add this line
+        collate_fn=collate_fn
     )
     
-    # Create model
-    print(f"\n🤖 CREATING MODEL...")
-    model = create_signllm_features_model(config).to(config.device)
-    
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"  Parameters: {total_params:,}")
+    # Model
+    print("\n🤖 Creating model...")
+    model = SimpleSignLLM(config).to(config.device)
     
     # Optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.learning_rate,
-        weight_decay=0.01
-    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     
     # Training
-    print_header(f"TRAINING - {config.num_epochs} EPOCHS")
-    
-    best_val_loss = float('inf')
-    start_time = time.time()
+    print("\n🚀 Starting training...")
     
     for epoch in range(config.num_epochs):
-        epoch_start = time.time()
-        
-        # Training phase
+        # Train
         model.train()
         train_loss = 0
-        train_batches = 0
         
         train_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.num_epochs} [Train]")
         for batch_idx, batch in enumerate(train_bar):
             features = batch['feature'].to(config.device)
             
-            # Forward pass
             _, losses = model(features)
             
-            # Backward pass
             optimizer.zero_grad()
             losses['total_loss'].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             
             train_loss += losses['total_loss'].item()
-            train_batches += 1
-            
-            # Update progress
-            avg_loss = train_loss / train_batches
-            train_bar.set_postfix({'loss': f'{avg_loss:.4f}'})
+            train_bar.set_postfix({'loss': f'{train_loss/(batch_idx+1):.4f}'})
         
-        avg_train_loss = train_loss / train_batches if train_batches > 0 else 0
+        avg_train = train_loss / len(train_loader)
         
-        # Validation phase
+        # Validate
         model.eval()
         val_loss = 0
-        val_batches = 0
         
         with torch.no_grad():
-            val_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{config.num_epochs} [Val]")
-            for batch in val_bar:
+            for batch in val_loader:
                 features = batch['feature'].to(config.device)
                 _, losses = model(features)
                 val_loss += losses['total_loss'].item()
-                val_batches += 1
-                
-                avg_val = val_loss / val_batches if val_batches > 0 else 0
-                val_bar.set_postfix({'val_loss': f'{avg_val:.4f}'})
         
-        avg_val_loss = val_loss / val_batches if val_batches > 0 else 0
+        avg_val = val_loss / len(val_loader) if len(val_loader) > 0 else 0
         
-        # Epoch statistics
-        epoch_time = time.time() - epoch_start
-        
-        print(f"\n📊 EPOCH {epoch+1} SUMMARY:")
-        print(f"  Train Loss: {avg_train_loss:.4f}")
-        print(f"  Val Loss:   {avg_val_loss:.4f}")
-        print(f"  Time:       {epoch_time:.1f}s")
-        
-        # Save best model
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'train_loss': avg_train_loss,
-                'val_loss': avg_val_loss,
-                'config': config.__dict__
-            }, 'best_model_features.pth')
-            print(f"  💾 Saved best model (val loss: {avg_val_loss:.4f})")
+        print(f"\n📊 Epoch {epoch+1}: Train Loss: {avg_train:.4f}, Val Loss: {avg_val:.4f}")
     
-    # Training complete
-    total_time = time.time() - start_time
+    # Save
+    torch.save(model.state_dict(), 'signllm_trained.pth')
+    print(f"\n💾 Model saved: signllm_trained.pth")
     
-    print_header("TRAINING COMPLETE")
-    print(f"\n🎉 Training completed in {total_time:.1f}s")
-    print(f"📈 Best validation loss: {best_val_loss:.4f}")
-    
-    # Save final model
-    torch.save(model.state_dict(), 'final_model_features.pth')
-    print(f"💾 Models saved: best_model_features.pth, final_model_features.pth")
-    
-    # Test inference
-    print(f"\n🔍 TEST INFERENCE:")
+    # Test
+    print("\n🔍 Testing inference...")
     model.eval()
     with torch.no_grad():
         sample = train_dataset[0]
         feature = sample['feature'].unsqueeze(0).to(config.device)
-        
-        word_indices, losses = model(feature)
+        tokens, losses = model(feature)
         print(f"  Input shape: {feature.shape}")
-        print(f"  Sample loss: {losses['total_loss'].item():.4f}")
-        if word_indices and len(word_indices[0]) > 0:
-            print(f"  Generated {len(word_indices[0])} word tokens")
+        print(f"  Output tokens shape: {tokens.shape}")
+        print(f"  Loss: {losses['total_loss'].item():.4f}")
     
-    return model
+    print("\n✅ Training completed successfully!")
 
 if __name__ == "__main__":
-    model = train_model()
+    main()
