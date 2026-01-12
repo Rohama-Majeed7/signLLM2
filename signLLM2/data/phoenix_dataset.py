@@ -1,5 +1,5 @@
 """
-Phoenix-2014T I3D Features Dataset Loader - Fixed
+Phoenix-2014T I3D Features Dataset Loader - Fixed padding
 """
 import os
 import torch
@@ -7,30 +7,34 @@ from torch.utils.data import Dataset
 import numpy as np
 import pandas as pd
 import random
+from torch.nn.utils.rnn import pad_sequence
 
 class PhoenixFeaturesDataset(Dataset):
     def __init__(self, data_root, split='train', config=None, max_samples=None):
+        """
+        Args:
+            data_root: Root directory of dataset
+            split: Dataset split ('train', 'val', 'test')
+            config: Configuration object
+            max_samples: Maximum number of samples to load
+        """
         self.split = split
         self.config = config
         self.max_samples = max_samples
+        self.max_seq_length = 100  # Maximum sequence length for padding
         
-        # Set feature paths based on config
-        if config.use_i3d_features:
-            self.features_dir = os.path.join(config.i3d_features_dir, split)
-            self.feature_dim = config.i3d_feature_dim
-            print(f"Using I3D features from: {self.features_dir}")
-        else:
-            self.features_dir = os.path.join(config.mediapipe_features_dir, split)
-            self.feature_dim = config.mediapipe_feature_dim
-            print(f"Using MediaPipe features from: {self.features_dir}")
+        # Set feature directory
+        self.features_dir = os.path.join(config.features_dir, split)
         
-        # Load annotations
+        # Load annotations if available
         self.annotations = self._load_annotations()
         
-        # Load features and texts
-        self.features, self.texts, self.feature_files = self._load_features()
+        # Load features
+        self.features, self.texts, self.filenames, self.original_lengths = self._load_features()
         
-        print(f"✅ Phoenix-2014T Features {split} dataset loaded: {len(self)} samples")
+        print(f"✅ Phoenix-2014T Features {split}: {len(self)} samples loaded")
+        print(f"   Max sequence length: {self.max_seq_length}")
+        print(f"   Feature dimension: {self.config.feature_dim}")
     
     def _load_annotations(self):
         """Load annotations from TSV files"""
@@ -46,114 +50,145 @@ class PhoenixFeaturesDataset(Dataset):
             if os.path.exists(anno_path):
                 try:
                     print(f"Loading annotations from: {anno_path}")
-                    # TSV files are tab-separated, no header
+                    # TSV files with no header, tab-separated
                     df = pd.read_csv(anno_path, sep='\t', header=None, on_bad_lines='skip')
                     
-                    # Check number of columns
+                    # Assuming format: video_id \t text
                     if len(df.columns) >= 2:
-                        # First column is video_id, second is text
-                        df = df[[0, 1]]
+                        df = df.iloc[:, :2]  # Take first two columns
                         df.columns = ['video_id', 'text']
-                        print(f"Loaded {len(df)} annotations with video_id and text")
-                    else:
-                        # Only text column
-                        df.columns = ['text']
-                        df['video_id'] = df.index.astype(str)
-                        print(f"Loaded {len(df)} annotations with only text")
-                    
-                    return df
-                    
+                        print(f"Loaded {len(df)} annotations")
+                        return df
                 except Exception as e:
                     print(f"Error loading annotations: {e}")
-                    import traceback
-                    traceback.print_exc()
         
         return None
     
     def _load_features(self):
-        """Load pre-extracted features"""
+        """Load pre-extracted I3D features with padding"""
         if not os.path.exists(self.features_dir):
             print(f"Error: Features directory not found: {self.features_dir}")
-            return [], [], []
+            return [], [], [], []
         
         # Get all .npy files
-        feature_files = []
-        for file in os.listdir(self.features_dir):
-            if file.endswith('.npy'):
-                feature_files.append(file)
+        all_files = [f for f in os.listdir(self.features_dir) if f.endswith('.npy')]
+        
+        if not all_files:
+            print(f"Warning: No .npy files found in {self.features_dir}")
+            return [], [], [], []
         
         # Sort for reproducibility
-        feature_files.sort()
-        
-        print(f"Found {len(feature_files)} feature files in {self.features_dir}")
+        all_files.sort()
         
         # Limit samples if specified
-        if self.max_samples and len(feature_files) > self.max_samples:
-            indices = list(range(len(feature_files)))
+        if self.max_samples and len(all_files) > self.max_samples:
+            indices = list(range(len(all_files)))
             random.seed(42)
             selected_indices = random.sample(indices, self.max_samples)
-            feature_files = [feature_files[i] for i in selected_indices]
+            all_files = [all_files[i] for i in selected_indices]
         
-        # Load features and find corresponding texts
+        print(f"Found {len(all_files)} feature files in {self.split} split")
+        
         features_list = []
         texts_list = []
-        files_list = []
+        filenames_list = []
+        lengths_list = []
         
-        for feature_file in feature_files:
-            feature_path = os.path.join(self.features_dir, feature_file)
+        # Find max length for padding
+        max_len = 0
+        sample_lengths = []
+        
+        for i, filename in enumerate(all_files):
+            if i % 50 == 0:
+                print(f"  Scanning file {i+1}/{len(all_files)}...")
+            
+            file_path = os.path.join(self.features_dir, filename)
             
             try:
                 # Load numpy array
-                feature_array = np.load(feature_path, allow_pickle=True)
+                feature_array = np.load(file_path, allow_pickle=True)
                 
-                print(f"Debug: Loaded {feature_file} with shape: {feature_array.shape} and dtype: {feature_array.dtype}")
+                if isinstance(feature_array, np.ndarray):
+                    seq_length = feature_array.shape[0]
+                    sample_lengths.append(seq_length)
+                    max_len = max(max_len, seq_length)
+                    
+            except Exception as e:
+                continue
+        
+        # Calculate statistics
+        if sample_lengths:
+            print(f"Sequence length statistics:")
+            print(f"  Min: {min(sample_lengths)}")
+            print(f"  Max: {max(sample_lengths)}")
+            print(f"  Mean: {np.mean(sample_lengths):.1f}")
+            print(f"  Median: {np.median(sample_lengths)}")
+        
+        # Set max sequence length (clip at 200 for memory)
+        self.max_seq_length = min(max_len, 200)
+        print(f"Using max sequence length: {self.max_seq_length}")
+        
+        # Now load and pad features
+        for i, filename in enumerate(all_files):
+            if i % 50 == 0:
+                print(f"  Loading file {i+1}/{len(all_files)}...")
+            
+            file_path = os.path.join(self.features_dir, filename)
+            
+            try:
+                # Load numpy array
+                feature_array = np.load(file_path, allow_pickle=True)
                 
                 # Convert to tensor
                 if isinstance(feature_array, np.ndarray):
                     feature_tensor = torch.from_numpy(feature_array).float()
                     
-                    # Check shape
-                    if feature_tensor.dim() == 0:
-                        # Scalar - skip
-                        print(f"Skipping scalar feature: {feature_file}")
+                    # Ensure feature dimension matches config
+                    if feature_tensor.shape[-1] != self.config.feature_dim:
+                        print(f"Warning: Feature {filename} has dimension {feature_tensor.shape[-1]}, "
+                              f"expected {self.config.feature_dim}")
                         continue
                     
-                    # Ensure last dimension matches expected feature dimension
-                    if feature_tensor.shape[-1] != self.feature_dim:
-                        print(f"Warning: Feature {feature_file} has dimension {feature_tensor.shape[-1]}, expected {self.feature_dim}")
-                        # Try to reshape or skip
-                        continue
+                    # Pad or truncate sequence
+                    seq_length = feature_tensor.shape[0]
                     
-                else:
-                    print(f"Unexpected data type in {feature_file}: {type(feature_array)}")
-                    continue
-                
-                # Get text from annotations
-                text = self._get_text_from_annotations(feature_file)
-                
-                features_list.append(feature_tensor)
-                texts_list.append(text)
-                files_list.append(feature_file)
-                
+                    if seq_length > self.max_seq_length:
+                        # Truncate: take middle part
+                        start = (seq_length - self.max_seq_length) // 2
+                        feature_tensor = feature_tensor[start:start + self.max_seq_length]
+                    elif seq_length < self.max_seq_length:
+                        # Pad with zeros
+                        padding = self.max_seq_length - seq_length
+                        feature_tensor = torch.cat([
+                            feature_tensor,
+                            torch.zeros(padding, self.config.feature_dim)
+                        ], dim=0)
+                    
+                    # Get corresponding text
+                    text = self._get_text_for_file(filename)
+                    
+                    features_list.append(feature_tensor)
+                    texts_list.append(text)
+                    filenames_list.append(filename)
+                    lengths_list.append(min(seq_length, self.max_seq_length))
+                    
             except Exception as e:
-                print(f"Error loading feature file {feature_file}: {e}")
-                import traceback
-                traceback.print_exc()
+                print(f"Error loading {filename}: {e}")
                 continue
         
-        return features_list, texts_list, files_list
+        return features_list, texts_list, filenames_list, lengths_list
     
-    def _get_text_from_annotations(self, feature_file):
-        """Get text for feature file from annotations"""
+    def _get_text_for_file(self, filename):
+        """Get text annotation for a feature file"""
         if self.annotations is None:
             # Use filename as text
-            base_name = os.path.splitext(feature_file)[0]
-            return f"Sign language: {base_name}"
+            base_name = os.path.splitext(filename)[0]
+            return f"Sign: {base_name}"
         
         # Remove .npy extension
-        video_id = os.path.splitext(feature_file)[0]
+        video_id = os.path.splitext(filename)[0]
         
-        # Try exact match with video_id column
+        # Try to find in annotations
         if 'video_id' in self.annotations.columns:
             matches = self.annotations[self.annotations['video_id'] == video_id]
             if not matches.empty:
@@ -161,16 +196,12 @@ class PhoenixFeaturesDataset(Dataset):
         
         # Try partial match
         for _, row in self.annotations.iterrows():
-            # Check if video_id is in text or vice versa
             if 'video_id' in row and isinstance(row['video_id'], str):
                 if video_id in row['video_id'] or row['video_id'] in video_id:
                     return row['text']
-            elif 'text' in row:
-                if video_id in row['text']:
-                    return row['text']
         
-        # Use filename as fallback
-        return f"Sign language: {video_id}"
+        # Fallback
+        return f"Sign: {video_id}"
     
     def __len__(self):
         return len(self.features)
@@ -178,13 +209,30 @@ class PhoenixFeaturesDataset(Dataset):
     def __getitem__(self, idx):
         feature = self.features[idx]
         text = self.texts[idx]
-        feature_file = self.feature_files[idx]
+        filename = self.filenames[idx]
+        seq_length = self.original_lengths[idx]
         
-        # Debug shape
-        print(f"Debug Dataset Item {idx}: Feature shape: {feature.shape}")
+        # Feature should already be padded to max_seq_length
+        # shape: (max_seq_length, feature_dim)
         
         return {
             'feature': feature,
             'text': text,
-            'feature_file': feature_file
+            'filename': filename,
+            'seq_length': seq_length
         }
+
+# Custom collate function for variable length sequences
+def features_collate_fn(batch):
+    """Custom collate function for features"""
+    features = torch.stack([item['feature'] for item in batch])
+    texts = [item['text'] for item in batch]
+    filenames = [item['filename'] for item in batch]
+    seq_lengths = torch.tensor([item['seq_length'] for item in batch])
+    
+    return {
+        'feature': features,
+        'text': texts,
+        'filename': filenames,
+        'seq_length': seq_lengths
+    }

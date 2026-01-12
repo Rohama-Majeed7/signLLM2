@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from configs.config import Config
 from models.signllm import create_signllm_features_model
 from data.phoenix_dataset import PhoenixFeaturesDataset
+from data.phoenix_dataset import features_collate_fn
 
 def print_header(title):
     """Print formatted header"""
@@ -40,7 +41,7 @@ def train_model():
     # Create datasets
     print(f"\n📁 LOADING DATASETS:")
     
-    train_dataset = PhoenixFeaturesDataset(
+    train_dataset = features_collate_fn(
         config.data_root,
         split=config.train_split,
         config=config,
@@ -59,17 +60,19 @@ def train_model():
     
     # Create dataloaders
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=0
-    )
+    train_dataset,
+    batch_size=config.batch_size,
+    shuffle=True,
+    num_workers=0,
+    collate_fn=features_collate_fn  # Add this line
+)
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
-        num_workers=0
+        num_workers=0,
+        collate_fn=features_collate_fn  # Add this line
     )
     
     # Create model
