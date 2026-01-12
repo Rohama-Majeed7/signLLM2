@@ -1,176 +1,85 @@
-"""
-Gloss-Free SignLLM Model with Contrastive Learning
-"""
+# File: signllm/models/signllm.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from signLLM2.configs.config import config
 
-class GlossFreeVQ(nn.Module):
-    """VQ module optimized for gloss-free training"""
-    def __init__(self, config):
+class SignLLM_VQ(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.config = config
         
-        # Stronger encoder for gloss-free
+        # 1. Feature Compression
         self.encoder = nn.Sequential(
-            nn.Linear(config.feature_dim, 768),
+            nn.Linear(config.input_dim, 768),
             nn.LayerNorm(768),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(768, config.codebook_dim),
-            nn.LayerNorm(config.codebook_dim),
-            nn.ReLU()
+            nn.Linear(768, config.codebook_dim)
         )
         
-        # Larger codebook for gloss-free
+        # 2. VQ Codebook
         self.codebook = nn.Embedding(config.codebook_size, config.codebook_dim)
-        nn.init.normal_(self.codebook.weight, mean=0, std=0.02)
+        # Init codebook properly
+        nn.init.uniform_(self.codebook.weight, -1/config.codebook_size, 1/config.codebook_size)
         
-        # Decoder for reconstruction
-        self.decoder = nn.Sequential(
-            nn.Linear(config.codebook_dim, 768),
-            nn.ReLU(),
-            nn.Linear(768, config.feature_dim)
+        # 3. Context Modeling (Transformer) - Best for Gloss Free
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.codebook_dim,
+            nhead=config.transformer_heads,
+            dim_feedforward=2048,
+            batch_first=True
         )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.transformer_layers)
         
-        # Projection for contrastive learning
-        self.projection = nn.Sequential(
-            nn.Linear(config.codebook_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128)
-        )
-    
-    def encode(self, x):
-        """Encode input features"""
-        B, T, D = x.shape
-        encoded = []
-        
-        for t in range(T):
-            enc = self.encoder(x[:, t, :])
-            encoded.append(enc)
-        
-        return torch.stack(encoded, dim=1)  # (B, T, codebook_dim)
-    
-    def quantize(self, encoded):
-        """Quantize with straight-through estimator"""
-        B, T, D = encoded.shape
-        flat_encoded = encoded.reshape(-1, D)
-        
-        # Calculate distances
-        distances = torch.cdist(flat_encoded, self.codebook.weight)
-        
-        # Get indices
-        indices = torch.argmin(distances, dim=-1)
-        
-        # Quantized vectors
-        quantized = self.codebook(indices).view(B, T, D)
-        
-        # Straight-through estimator
-        quantized_st = encoded + (quantized - encoded).detach()
-        
-        return indices.view(B, T), quantized, quantized_st
-    
-    def forward(self, x):
-        """Forward with reconstruction and contrastive losses"""
-        B, T, D = x.shape
-        
-        # Encode
-        encoded = self.encode(x)
-        
-        # Quantize
-        indices, quantized, quantized_st = self.quantize(encoded)
-        
-        # Decode for reconstruction
-        reconstructed = []
-        for t in range(T):
-            recon_t = self.decoder(quantized_st[:, t, :])
-            reconstructed.append(recon_t)
-        reconstructed = torch.stack(reconstructed, dim=1)
-        
-        # Reconstruction loss
-        recon_loss = F.mse_loss(reconstructed, x)
-        
-        # VQ losses
-        commitment_loss = F.mse_loss(encoded, quantized.detach())
-        codebook_loss = F.mse_loss(quantized, encoded.detach())
-        
-        # Contrastive loss (simplified)
-        contrastive_loss = torch.tensor(0.0, device=x.device)
-        if self.config.use_contrastive_loss and B > 1:
-            # Project for contrastive learning
-            projected = self.projection(quantized_st.mean(dim=1))  # (B, 128)
-            
-            # Simple contrastive loss
-            norm_proj = F.normalize(projected, dim=-1)
-            sim_matrix = torch.mm(norm_proj, norm_proj.T)  # (B, B)
-            
-            # Temperature scaling
-            temperature = 0.1
-            sim_matrix = sim_matrix / temperature
-            
-            # Contrastive loss
-            labels = torch.arange(B, device=x.device)
-            contrastive_loss = F.cross_entropy(sim_matrix, labels)
-        
-        # Total loss
-        total_loss = (
-            recon_loss * self.config.lambda_reconstruction +
-            commitment_loss * self.config.lambda_commitment +
-            codebook_loss * self.config.lambda_codebook +
-            contrastive_loss * self.config.lambda_contrastive
-        )
-        
-        return indices, {
-            'recon_loss': recon_loss,
-            'commitment_loss': commitment_loss,
-            'codebook_loss': codebook_loss,
-            'contrastive_loss': contrastive_loss,
-            'total_loss': total_loss
-        }
+        # 4. Decoder (Reconstruction)
+        self.decoder = nn.Linear(config.codebook_dim, config.input_dim)
 
-class GlossFreeSignLLM(nn.Module):
-    """Complete gloss-free model"""
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
+    def forward(self, x, mask=None):
+        # x: (Batch, Time, 1024)
         
-        # VQ module
-        self.vq = GlossFreeVQ(config)
+        # Encode -> (Batch, Time, 512)
+        z_e = self.encoder(x)
         
-        # Context modeling
-        self.context_model = nn.GRU(
-            config.codebook_dim,
-            config.codebook_dim,
-            num_layers=2,
-            batch_first=True,
-            dropout=0.1
-        )
+        # --- Vector Quantization (VQ) ---
+        z_e_flat = z_e.view(-1, config.codebook_dim)
         
-        # Text decoder (for text generation)
-        vocab_size = 3000  # Target vocabulary size
-        self.text_decoder = nn.Sequential(
-            nn.Linear(config.codebook_dim, 512),
-            nn.ReLU(),
-            nn.Linear(512, vocab_size)
-        )
-    
-    def forward(self, x):
-        # VQ encoding
-        tokens, vq_losses = self.vq(x)
+        # Distances calculate karna
+        d = torch.sum(z_e_flat ** 2, dim=1, keepdim=True) + \
+            torch.sum(self.codebook.weight ** 2, dim=1) - \
+            2 * torch.matmul(z_e_flat, self.codebook.weight.t())
+            
+        min_indices = torch.argmin(d, dim=1)
+        z_q = self.codebook(min_indices).view(z_e.shape)
         
-        # Get quantized features
-        B, T = tokens.shape
-        quantized = self.vq.codebook(tokens.reshape(-1)).view(B, T, -1)
+        # Straight Through Estimator (Gradient flow ke liye zaroori hai)
+        z_q = z_e + (z_q - z_e).detach()
         
-        # Context modeling
-        context, _ = self.context_model(quantized)
+        # --- Transformer Context ---
+        # Masking: Padding positions (False in mask) should be ignored
+        if mask is not None:
+            # Transformer expects True for padding to be IGNORED
+            padding_mask = ~mask
+            context = self.transformer(z_q, src_key_padding_mask=padding_mask)
+        else:
+            context = self.transformer(z_q)
+            
+        # Reconstruct
+        recon = self.decoder(context)
         
-        # Text generation (placeholder for gloss-free)
-        # In real implementation, you would use this with text data
-        text_logits = self.text_decoder(context.mean(dim=1))
+        # --- Losses ---
+        # 1. Reconstruction Loss (Sirf valid frames par, padding par nahi)
+        if mask is not None:
+            recon_loss = F.mse_loss(recon[mask], x[mask])
+            commit_loss = F.mse_loss(z_e[mask], z_q.detach()[mask])
+            codebook_loss = F.mse_loss(z_q[mask], z_e.detach()[mask])
+        else:
+            recon_loss = F.mse_loss(recon, x)
+            commit_loss = F.mse_loss(z_e, z_q.detach())
+            codebook_loss = F.mse_loss(z_q, z_e.detach())
+            
+        total_loss = recon_loss + commit_loss + 0.25 * codebook_loss
         
-        return tokens, {
-            **vq_losses,
-            'text_loss': torch.tensor(0.1, device=x.device),  # Placeholder
-            'total_loss': vq_losses['total_loss']
+        return {
+            'loss': total_loss,
+            'recon_loss': recon_loss,
+            'tokens': min_indices.view(x.shape[0], -1)
         }
