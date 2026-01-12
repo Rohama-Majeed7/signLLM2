@@ -1,273 +1,297 @@
 """
-Simple training with gradient fix
+Gloss-Free Training for SignLLM
 """
 import os
-import sys
 import torch
 import torch.nn as nn
-import numpy as np
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from tqdm import tqdm
+import numpy as np
 
-print("=" * 60)
-print("SIGNLLM TRAINING - WITH GRADIENT FIX")
-print("=" * 60)
+print("=" * 70)
+print("GLOSS-FREE SIGNLLM TRAINING")
+print("=" * 70)
 
-# Add to path
-sys.path.insert(0, '/kaggle/working/signLLM2')
-
-# ==================== CONFIG ====================
-class SimpleConfig:
-    # Device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Paths
-    data_root = "/kaggle/input/rwth-phoenix-2014t-i3d-features-mediapipe-features"
-    features_dir = os.path.join(data_root, "i3d_features_rwth phoenix 2014t/i3d_features_rwth phoenix 2014t")
+# Config
+class GlossFreeConfig:
+    # Gloss-free settings
+    gloss_free = True
+    use_contrastive_loss = True
+    use_reconstruction_loss = True
     
     # Model
     feature_dim = 1024
-    codebook_size = 256
-    codebook_dim = 512
+    codebook_size = 512
+    codebook_dim = 768
     
     # Training
-    batch_size = 4
-    learning_rate = 0.001
-    num_epochs = 5
-    fixed_length = 100
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    batch_size = 8
+    learning_rate = 1e-4
+    num_epochs = 30
+    warmup_epochs = 5
+    max_seq_length = 150
+    
+    # Loss weights
+    lambda_commitment = 1.0
+    lambda_codebook = 0.25
+    lambda_reconstruction = 1.0
+    lambda_contrastive = 0.5
     
     # Dataset
-    max_train_samples = 50
-    max_val_samples = 20
+    data_root = "/kaggle/input/rwth-phoenix-2014t-i3d-features-mediapipe-features"
+    features_dir = os.path.join(data_root, "i3d_features_rwth phoenix 2014t/i3d_features_rwth phoenix 2014t")
+    max_train_samples = 500
+    max_val_samples = 100
 
-config = SimpleConfig()
-print(f"📊 Config:")
-print(f"  Device: {config.device}")
-print(f"  Batch size: {config.batch_size}")
+config = GlossFreeConfig()
+print(f"📊 Gloss-Free Configuration:")
+print(f"  Codebook: {config.codebook_size} tokens, dim {config.codebook_dim}")
+print(f"  Contrastive Learning: {'Yes' if config.use_contrastive_loss else 'No'}")
+print(f"  Reconstruction Loss: {'Yes' if config.use_reconstruction_loss else 'No'}")
+print(f"  Learning rate: {config.learning_rate}")
 print(f"  Epochs: {config.num_epochs}")
 
-# ==================== DATASET ====================
-print("\n📁 Loading dataset...")
+# Dataset
+print(f"\n📁 Loading gloss-free dataset...")
 
-class SimpleDataset(Dataset):
-    def __init__(self, split='train'):
-        self.split = split
-        self.files = []
-        
-        split_dir = os.path.join(config.features_dir, split)
-        if os.path.exists(split_dir):
-            self.files = [f for f in os.listdir(split_dir) if f.endswith('.npy')]
-            
-            # Limit samples
-            if split == 'train':
-                self.files = self.files[:config.max_train_samples]
-            else:
-                self.files = self.files[:config.max_val_samples]
-        
-        print(f"  {split}: Found {len(self.files)} files")
+def load_gloss_free_features(split='train'):
+    features_dir = os.path.join(config.features_dir, split)
+    features = []
     
-    def __len__(self):
-        return len(self.files)
+    if os.path.exists(features_dir):
+        files = [f for f in os.listdir(features_dir) if f.endswith('.npy')]
+        
+        if split == 'train':
+            files = files[:config.max_train_samples]
+        else:
+            files = files[:config.max_val_samples]
+        
+        for filename in files:
+            file_path = os.path.join(features_dir, filename)
+            try:
+                arr = np.load(file_path, allow_pickle=True)
+                if isinstance(arr, np.ndarray):
+                    tensor = torch.from_numpy(arr).float()
+                    
+                    # Reshape
+                    if tensor.dim() == 1:
+                        tensor = tensor.unsqueeze(0)
+                    elif tensor.dim() > 2:
+                        tensor = tensor.reshape(-1, 1024)
+                    
+                    # Fixed length
+                    T = tensor.shape[0]
+                    if T > config.max_seq_length:
+                        tensor = tensor[:config.max_seq_length]
+                    elif T < config.max_seq_length:
+                        pad = config.max_seq_length - T
+                        tensor = nn.functional.pad(tensor, (0, 0, 0, pad))
+                    
+                    features.append(tensor)
+            except:
+                continue
     
-    def __getitem__(self, idx):
-        file_path = os.path.join(config.features_dir, self.split, self.files[idx])
-        
-        try:
-            arr = np.load(file_path, allow_pickle=True)
-            if isinstance(arr, np.ndarray):
-                tensor = torch.from_numpy(arr).float()
-                
-                # Ensure shape (T, 1024)
-                if tensor.dim() == 1:
-                    tensor = tensor.unsqueeze(0)
-                elif tensor.dim() > 2:
-                    tensor = tensor.reshape(-1, 1024)
-                
-                # Pad/truncate
-                T = tensor.shape[0]
-                if T > config.fixed_length:
-                    tensor = tensor[:config.fixed_length]
-                elif T < config.fixed_length:
-                    pad = config.fixed_length - T
-                    padding = torch.zeros(pad, 1024)
-                    tensor = torch.cat([tensor, padding], dim=0)
-                
-                return {
-                    'feature': tensor,
-                    'text': f"Video {idx}"
-                }
-        except:
-            pass
-        
-        # Fallback
-        return {
-            'feature': torch.zeros(config.fixed_length, 1024),
-            'text': "Sample"
-        }
+    print(f"  {split}: {len(features)} samples")
+    return features
 
-# Create datasets
-train_dataset = SimpleDataset('train')
-val_dataset = SimpleDataset('val')
+# Load data
+train_features = load_gloss_free_features('train')
+val_features = load_gloss_free_features('val')
 
-print(f"  Train samples: {len(train_dataset)}")
-print(f"  Val samples: {len(val_dataset)}")
-
-# ==================== DATALOADER ====================
-def collate_fn(batch):
-    features = torch.stack([item['feature'] for item in batch])
-    texts = [item['text'] for item in batch]
-    return {'feature': features, 'text': texts}
-
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=config.batch_size,
-    shuffle=True,
-    collate_fn=collate_fn
-)
-
-val_loader = DataLoader(
-    val_dataset,
-    batch_size=config.batch_size,
-    shuffle=False,
-    collate_fn=collate_fn
-)
-
-# ==================== MODEL - FIXED ====================
-print("\n🤖 Creating model...")
-
-class SimpleModel(nn.Module):
+# Simple model for gloss-free
+class SimpleGlossFreeModel(nn.Module):
     def __init__(self):
         super().__init__()
-        
-        # Feature encoder
+        # Encoder
         self.encoder = nn.Sequential(
-            nn.Linear(1024, 512),
+            nn.Linear(1024, 768),
+            nn.LayerNorm(768),
             nn.ReLU(),
-            nn.Linear(512, 256)
+            nn.Linear(768, 512),
+            nn.LayerNorm(512),
+            nn.ReLU()
         )
         
         # Codebook
-        self.codebook = nn.Embedding(128, 256)
+        self.codebook = nn.Embedding(512, 512)
         
         # Decoder
-        self.decoder = nn.Linear(256, 100)
+        self.decoder = nn.Sequential(
+            nn.Linear(512, 768),
+            nn.ReLU(),
+            nn.Linear(768, 1024)
+        )
         
+        # Contrastive projection
+        self.projection = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128)
+        )
+    
     def forward(self, x):
-        # x shape: (B, T, D)
         B, T, D = x.shape
         
         # Encode
         encoded = []
         for t in range(T):
-            feat = x[:, t, :]
-            enc = self.encoder(feat)
+            enc = self.encoder(x[:, t, :])
             encoded.append(enc)
-        
-        encoded = torch.stack(encoded, dim=1)  # (B, T, 256)
+        encoded = torch.stack(encoded, dim=1)
         
         # Quantize
-        flat_encoded = encoded.reshape(-1, 256)
+        flat = encoded.reshape(-1, 512)
+        distances = torch.cdist(flat, self.codebook.weight)
+        indices = torch.argmin(distances, dim=-1)
+        quantized = self.codebook(indices).view(B, T, 512)
         
-        # Calculate distances to codebook
-        distances = torch.cdist(flat_encoded, self.codebook.weight)
+        # Straight-through
+        quantized_st = encoded + (quantized - encoded).detach()
         
-        # Get nearest codebook entries
-        token_indices = torch.argmin(distances, dim=-1)
-        quantized = self.codebook(token_indices).view(B, T, 256)
+        # Decode
+        decoded = []
+        for t in range(T):
+            dec = self.decoder(quantized_st[:, t, :])
+            decoded.append(dec)
+        decoded = torch.stack(decoded, dim=1)
         
-        # Proper VQ loss with gradients
+        # Losses
+        recon_loss = nn.functional.mse_loss(decoded, x)
         commitment_loss = nn.functional.mse_loss(encoded, quantized.detach())
         codebook_loss = nn.functional.mse_loss(quantized, encoded.detach())
         
-        # Decode
-        pooled = encoded.mean(dim=1)  # (B, 256)
-        decoded = self.decoder(pooled)
+        # Contrastive loss
+        contrastive_loss = torch.tensor(0.0, device=x.device)
+        if config.use_contrastive_loss and B > 1:
+            proj = self.projection(quantized_st.mean(dim=1))
+            norm_proj = nn.functional.normalize(proj, dim=-1)
+            sim = torch.mm(norm_proj, norm_proj.T) / 0.1
+            labels = torch.arange(B, device=x.device)
+            contrastive_loss = nn.functional.cross_entropy(sim, labels)
         
-        # Total loss with gradients
-        total_loss = commitment_loss + 0.25 * codebook_loss
+        # Total
+        total_loss = (
+            recon_loss * config.lambda_reconstruction +
+            commitment_loss * config.lambda_commitment +
+            codebook_loss * config.lambda_codebook +
+            contrastive_loss * config.lambda_contrastive
+        )
         
-        # Return proper tensors
-        return token_indices.view(B, T), {
-            'commitment_loss': commitment_loss,
-            'codebook_loss': codebook_loss,
+        return indices.view(B, T), {
+            'recon_loss': recon_loss.item(),
+            'commitment_loss': commitment_loss.item(),
+            'codebook_loss': codebook_loss.item(),
+            'contrastive_loss': contrastive_loss.item(),
             'total_loss': total_loss
         }
 
-model = SimpleModel().to(config.device)
-print(f"✅ Model created with {sum(p.numel() for p in model.parameters()):,} parameters")
+# Create model
+model = SimpleGlossFreeModel().to(config.device)
+print(f"\n🤖 Model created: {sum(p.numel() for p in model.parameters()):,} parameters")
 
-# ==================== TRAINING ====================
-print("\n🚀 Starting training...")
+# Training
+print(f"\n🚀 Starting gloss-free training...")
 
-optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+# Optimizer with warmup
+optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=0.01)
 
+# Learning rate scheduler
+def lr_lambda(epoch):
+    if epoch < config.warmup_epochs:
+        return float(epoch) / float(max(1, config.warmup_epochs))
+    return max(0.0, float(config.num_epochs - epoch) / float(max(1, config.num_epochs - config.warmup_epochs)))
+
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+# Training loop
 for epoch in range(config.num_epochs):
-    # Train
     model.train()
-    train_loss = 0
-    train_batches = 0
+    total_loss = 0
+    recon_loss = 0
+    vq_loss = 0
+    contrastive_loss = 0
     
-    train_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.num_epochs}")
-    for batch_idx, batch in enumerate(train_bar):
-        features = batch['feature'].to(config.device)
+    # Shuffle training data
+    indices = list(range(len(train_features)))
+    np.random.shuffle(indices)
+    
+    num_batches = len(indices) // config.batch_size
+    
+    pbar = tqdm(range(num_batches), desc=f"Epoch {epoch+1}/{config.num_epochs}")
+    
+    for batch_idx in pbar:
+        # Get batch
+        start = batch_idx * config.batch_size
+        end = start + config.batch_size
+        batch_indices = indices[start:end]
         
-        _, losses = model(features)
+        batch = torch.stack([train_features[i] for i in batch_indices]).to(config.device)
         
-        # Check if loss requires grad
-        if not losses['total_loss'].requires_grad:
-            print(f"Warning: Loss does not require gradient!")
-            continue
+        # Forward
+        _, losses = model(batch)
         
+        # Backward
         optimizer.zero_grad()
-        losses['total_loss'].backward()
+        model.module.total_loss.backward() if hasattr(model, 'module') else losses['total_loss'].backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         
-        train_loss += losses['total_loss'].item()
-        train_batches += 1
+        # Accumulate
+        total_loss += losses['total_loss'].item()
+        recon_loss += losses['recon_loss']
+        vq_loss += losses['commitment_loss'] + losses['codebook_loss']
+        contrastive_loss += losses['contrastive_loss']
         
-        avg_loss = train_loss / train_batches
-        train_bar.set_postfix({'loss': f'{avg_loss:.4f}'})
+        # Update progress
+        avg_loss = total_loss / (batch_idx + 1)
+        pbar.set_postfix({
+            'loss': f'{avg_loss:.4f}',
+            'recon': f'{recon_loss/(batch_idx+1):.4f}',
+            'vq': f'{vq_loss/(batch_idx+1):.4f}',
+            'lr': f'{optimizer.param_groups[0]["lr"]:.6f}'
+        })
     
-    avg_train = train_loss / train_batches if train_batches > 0 else 0
+    # Update LR
+    scheduler.step()
     
-    # Validate
+    # Validation
     model.eval()
-    val_loss = 0
-    val_batches = 0
+    val_total = 0
     
     with torch.no_grad():
-        for batch in val_loader:
-            features = batch['feature'].to(config.device)
-            _, losses = model(features)
-            val_loss += losses['total_loss'].item()
-            val_batches += 1
+        for i in range(0, len(val_features), config.batch_size):
+            batch = val_features[i:i+config.batch_size]
+            if len(batch) > 0:
+                batch_tensor = torch.stack(batch).to(config.device)
+                _, losses = model(batch_tensor)
+                val_total += losses['total_loss'].item()
     
-    avg_val = val_loss / val_batches if val_batches > 0 else 0
+    avg_train = total_loss / num_batches if num_batches > 0 else 0
+    avg_val = val_total / (len(val_features) // config.batch_size) if len(val_features) > 0 else 0
     
     print(f"\n📊 Epoch {epoch+1}:")
-    print(f"  Train Loss: {avg_train:.4f}")
+    print(f"  Train Loss: {avg_train:.4f} (Recon: {recon_loss/num_batches:.4f}, VQ: {vq_loss/num_batches:.4f})")
     print(f"  Val Loss: {avg_val:.4f}")
+    print(f"  Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
+    
+    # Save checkpoint
+    if (epoch + 1) % 10 == 0 or epoch == config.num_epochs - 1:
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'train_loss': avg_train,
+            'val_loss': avg_val,
+            'config': config.__dict__
+        }, f'gloss_free_checkpoint_epoch_{epoch+1}.pth')
+        print(f"  💾 Saved checkpoint")
 
-# ==================== SAVE ====================
-torch.save({
-    'model_state_dict': model.state_dict(),
-    'config': config.__dict__
-}, 'trained_model.pth')
-print(f"\n💾 Model saved: trained_model.pth")
+# Final save
+torch.save(model.state_dict(), 'gloss_free_final_model.pth')
+print(f"\n💾 Final model saved: gloss_free_final_model.pth")
 
-# ==================== TEST ====================
-print("\n🔍 Testing inference...")
-model.eval()
-with torch.no_grad():
-    sample = train_dataset[0]
-    feature = sample['feature'].unsqueeze(0).to(config.device)
-    tokens, losses = model(feature)
-    print(f"  Input shape: {feature.shape}")
-    print(f"  Output tokens shape: {tokens.shape}")
-    print(f"  Total loss: {losses['total_loss'].item():.4f}")
-    print(f"  Commitment loss: {losses['commitment_loss'].item():.4f}")
-    print(f"  Codebook loss: {losses['codebook_loss'].item():.4f}")
-
-print("\n" + "=" * 60)
-print("✅ TRAINING COMPLETED SUCCESSFULLY!")
-print("=" * 60)
+print("\n" + "=" * 70)
+print("🎉 GLOSS-FREE TRAINING COMPLETED!")
+print("=" * 70)
