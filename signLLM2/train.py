@@ -1,5 +1,5 @@
 """
-Simple training that definitely works
+Simple training with gradient fix
 """
 import os
 import sys
@@ -10,7 +10,7 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 print("=" * 60)
-print("SIGNLLM TRAINING - GUARANTEED TO WORK")
+print("SIGNLLM TRAINING - WITH GRADIENT FIX")
 print("=" * 60)
 
 # Add to path
@@ -33,7 +33,7 @@ class SimpleConfig:
     # Training
     batch_size = 4
     learning_rate = 0.001
-    num_epochs = 3
+    num_epochs = 5
     fixed_length = 100
     
     # Dataset
@@ -132,7 +132,7 @@ val_loader = DataLoader(
     collate_fn=collate_fn
 )
 
-# ==================== MODEL ====================
+# ==================== MODEL - FIXED ====================
 print("\n🤖 Creating model...")
 
 class SimpleModel(nn.Module):
@@ -149,6 +149,9 @@ class SimpleModel(nn.Module):
         # Codebook
         self.codebook = nn.Embedding(128, 256)
         
+        # Decoder
+        self.decoder = nn.Linear(256, 100)
+        
     def forward(self, x):
         # x shape: (B, T, D)
         B, T, D = x.shape
@@ -160,20 +163,38 @@ class SimpleModel(nn.Module):
             enc = self.encoder(feat)
             encoded.append(enc)
         
-        encoded = torch.stack(encoded, dim=1)
+        encoded = torch.stack(encoded, dim=1)  # (B, T, 256)
         
         # Quantize
-        flat = encoded.reshape(-1, 256)
-        distances = torch.cdist(flat, self.codebook.weight)
-        tokens = torch.argmin(distances, dim=-1)
+        flat_encoded = encoded.reshape(-1, 256)
         
-        # Simple loss
-        loss = torch.tensor(0.5, device=x.device)
+        # Calculate distances to codebook
+        distances = torch.cdist(flat_encoded, self.codebook.weight)
         
-        return tokens.view(B, T), {'total_loss': loss}
+        # Get nearest codebook entries
+        token_indices = torch.argmin(distances, dim=-1)
+        quantized = self.codebook(token_indices).view(B, T, 256)
+        
+        # Proper VQ loss with gradients
+        commitment_loss = nn.functional.mse_loss(encoded, quantized.detach())
+        codebook_loss = nn.functional.mse_loss(quantized, encoded.detach())
+        
+        # Decode
+        pooled = encoded.mean(dim=1)  # (B, 256)
+        decoded = self.decoder(pooled)
+        
+        # Total loss with gradients
+        total_loss = commitment_loss + 0.25 * codebook_loss
+        
+        # Return proper tensors
+        return token_indices.view(B, T), {
+            'commitment_loss': commitment_loss,
+            'codebook_loss': codebook_loss,
+            'total_loss': total_loss
+        }
 
 model = SimpleModel().to(config.device)
-print(f"✅ Model created")
+print(f"✅ Model created with {sum(p.numel() for p in model.parameters()):,} parameters")
 
 # ==================== TRAINING ====================
 print("\n🚀 Starting training...")
@@ -184,6 +205,7 @@ for epoch in range(config.num_epochs):
     # Train
     model.train()
     train_loss = 0
+    train_batches = 0
     
     train_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.num_epochs}")
     for batch_idx, batch in enumerate(train_bar):
@@ -191,32 +213,46 @@ for epoch in range(config.num_epochs):
         
         _, losses = model(features)
         
+        # Check if loss requires grad
+        if not losses['total_loss'].requires_grad:
+            print(f"Warning: Loss does not require gradient!")
+            continue
+        
         optimizer.zero_grad()
         losses['total_loss'].backward()
         optimizer.step()
         
         train_loss += losses['total_loss'].item()
-        train_bar.set_postfix({'loss': f'{train_loss/(batch_idx+1):.4f}'})
+        train_batches += 1
+        
+        avg_loss = train_loss / train_batches
+        train_bar.set_postfix({'loss': f'{avg_loss:.4f}'})
     
-    avg_train = train_loss / len(train_loader)
+    avg_train = train_loss / train_batches if train_batches > 0 else 0
     
     # Validate
     model.eval()
     val_loss = 0
+    val_batches = 0
+    
     with torch.no_grad():
         for batch in val_loader:
             features = batch['feature'].to(config.device)
             _, losses = model(features)
             val_loss += losses['total_loss'].item()
+            val_batches += 1
     
-    avg_val = val_loss / len(val_loader) if len(val_loader) > 0 else 0
+    avg_val = val_loss / val_batches if val_batches > 0 else 0
     
     print(f"\n📊 Epoch {epoch+1}:")
     print(f"  Train Loss: {avg_train:.4f}")
     print(f"  Val Loss: {avg_val:.4f}")
 
 # ==================== SAVE ====================
-torch.save(model.state_dict(), 'trained_model.pth')
+torch.save({
+    'model_state_dict': model.state_dict(),
+    'config': config.__dict__
+}, 'trained_model.pth')
 print(f"\n💾 Model saved: trained_model.pth")
 
 # ==================== TEST ====================
@@ -227,8 +263,10 @@ with torch.no_grad():
     feature = sample['feature'].unsqueeze(0).to(config.device)
     tokens, losses = model(feature)
     print(f"  Input shape: {feature.shape}")
-    print(f"  Output tokens: {tokens.shape}")
-    print(f"  Loss: {losses['total_loss'].item():.4f}")
+    print(f"  Output tokens shape: {tokens.shape}")
+    print(f"  Total loss: {losses['total_loss'].item():.4f}")
+    print(f"  Commitment loss: {losses['commitment_loss'].item():.4f}")
+    print(f"  Codebook loss: {losses['codebook_loss'].item():.4f}")
 
 print("\n" + "=" * 60)
 print("✅ TRAINING COMPLETED SUCCESSFULLY!")
