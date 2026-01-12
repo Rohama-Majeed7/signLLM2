@@ -1,6 +1,5 @@
 """
-Phoenix-2014T I3D Features Dataset Loader
-Loads pre-extracted I3D features instead of raw videos
+Phoenix-2014T I3D Features Dataset Loader - Fixed
 """
 import os
 import torch
@@ -47,22 +46,27 @@ class PhoenixFeaturesDataset(Dataset):
             if os.path.exists(anno_path):
                 try:
                     print(f"Loading annotations from: {anno_path}")
-                    # TSV files are tab-separated
-                    df = pd.read_csv(anno_path, sep='\t', header=None)
+                    # TSV files are tab-separated, no header
+                    df = pd.read_csv(anno_path, sep='\t', header=None, on_bad_lines='skip')
                     
-                    # Assuming format: video_id \t text
+                    # Check number of columns
                     if len(df.columns) >= 2:
+                        # First column is video_id, second is text
+                        df = df[[0, 1]]
                         df.columns = ['video_id', 'text']
-                    elif len(df.columns) == 1:
+                        print(f"Loaded {len(df)} annotations with video_id and text")
+                    else:
+                        # Only text column
                         df.columns = ['text']
-                        # Extract video_id from text or create one
                         df['video_id'] = df.index.astype(str)
+                        print(f"Loaded {len(df)} annotations with only text")
                     
-                    print(f"Loaded {len(df)} annotations")
                     return df
                     
                 except Exception as e:
                     print(f"Error loading annotations: {e}")
+                    import traceback
+                    traceback.print_exc()
         
         return None
     
@@ -100,23 +104,28 @@ class PhoenixFeaturesDataset(Dataset):
             
             try:
                 # Load numpy array
-                feature_array = np.load(feature_path)
+                feature_array = np.load(feature_path, allow_pickle=True)
+                
+                print(f"Debug: Loaded {feature_file} with shape: {feature_array.shape} and dtype: {feature_array.dtype}")
                 
                 # Convert to tensor
                 if isinstance(feature_array, np.ndarray):
-                    # Handle different feature shapes
-                    if feature_array.ndim == 1:
-                        # Single feature vector
-                        feature_tensor = torch.from_numpy(feature_array).float()
-                    elif feature_array.ndim == 2:
-                        # Temporal sequence of features
-                        # Take mean or use all frames
-                        feature_tensor = torch.from_numpy(feature_array).float()
-                    else:
-                        print(f"Unexpected feature shape in {feature_file}: {feature_array.shape}")
+                    feature_tensor = torch.from_numpy(feature_array).float()
+                    
+                    # Check shape
+                    if feature_tensor.dim() == 0:
+                        # Scalar - skip
+                        print(f"Skipping scalar feature: {feature_file}")
                         continue
+                    
+                    # Ensure last dimension matches expected feature dimension
+                    if feature_tensor.shape[-1] != self.feature_dim:
+                        print(f"Warning: Feature {feature_file} has dimension {feature_tensor.shape[-1]}, expected {self.feature_dim}")
+                        # Try to reshape or skip
+                        continue
+                    
                 else:
-                    print(f"Unexpected data type in {feature_file}")
+                    print(f"Unexpected data type in {feature_file}: {type(feature_array)}")
                     continue
                 
                 # Get text from annotations
@@ -128,6 +137,8 @@ class PhoenixFeaturesDataset(Dataset):
                 
             except Exception as e:
                 print(f"Error loading feature file {feature_file}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
         
         return features_list, texts_list, files_list
@@ -169,18 +180,8 @@ class PhoenixFeaturesDataset(Dataset):
         text = self.texts[idx]
         feature_file = self.feature_files[idx]
         
-        # Ensure feature has correct shape for model
-        # Model expects: (batch, channels, temporal, height, width) for videos
-        # But we have features, so we need to reshape
-        
-        if feature.dim() == 1:
-            # Single vector: reshape to (1, 1, feature_dim)
-            feature = feature.unsqueeze(0).unsqueeze(0)
-        elif feature.dim() == 2:
-            # Temporal features: reshape to (1, temporal, feature_dim)
-            # Model expects (C, T, H, W), so we need to add channel dimension
-            feature = feature.permute(1, 0)  # (feature_dim, temporal)
-            feature = feature.unsqueeze(0)  # Add channel dimension
+        # Debug shape
+        print(f"Debug Dataset Item {idx}: Feature shape: {feature.shape}")
         
         return {
             'feature': feature,

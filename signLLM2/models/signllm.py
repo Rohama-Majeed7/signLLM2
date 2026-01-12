@@ -1,5 +1,5 @@
 """
-SignLLM Model for I3D Features (instead of raw videos)
+SignLLM Model for I3D Features - Fixed shape handling
 """
 import torch
 import torch.nn as nn
@@ -45,18 +45,33 @@ class VQSignFeatures(nn.Module):
     
     def process_features(self, x):
         """
-        Process input features
-        x shape: (B, C, T, D) or (B, D) or similar
+        Process input features with flexible shape handling
+        x shape could be: (B, D), (B, T, D), (B, C, T, D), etc.
         Returns: (B, T, codebook_dim)
         """
         B = x.shape[0]
+        
+        print(f"Debug: Input shape: {x.shape}")
         
         # Handle different input shapes
         if x.dim() == 2:
             # (B, D) -> single feature vector
             x = x.unsqueeze(1)  # (B, 1, D)
+            print(f"Debug: Reshaped to: {x.shape}")
         
-        # x is now (B, T, D) or (B, 1, D)
+        elif x.dim() == 4:
+            # (B, C, T, D) -> flatten C and T
+            B, C, T, D = x.shape
+            x = x.permute(0, 2, 1, 3)  # (B, T, C, D)
+            x = x.reshape(B, T * C, D)  # (B, T*C, D)
+            print(f"Debug: Reshaped 4D to: {x.shape}")
+        
+        elif x.dim() > 4:
+            # Flatten all dimensions except batch and last
+            x = x.reshape(B, -1, x.shape[-1])
+            print(f"Debug: Flattened to: {x.shape}")
+        
+        # x should now be (B, T, D)
         B, T, D = x.shape
         
         # Process each temporal step
@@ -68,11 +83,14 @@ class VQSignFeatures(nn.Module):
         
         # Stack: (B, T, codebook_dim)
         features = torch.stack(processed, dim=1)
+        print(f"Debug: After processing: {features.shape}")
         
-        # Apply temporal convolution
-        features = features.permute(0, 2, 1)  # (B, codebook_dim, T)
-        features = self.temporal_conv(features)
-        features = features.permute(0, 2, 1)  # (B, T, codebook_dim)
+        # Apply temporal convolution if T > 1
+        if T > 1:
+            features = features.permute(0, 2, 1)  # (B, codebook_dim, T)
+            features = self.temporal_conv(features)
+            features = features.permute(0, 2, 1)  # (B, T, codebook_dim)
+            print(f"Debug: After temporal conv: {features.shape}")
         
         return features
     
