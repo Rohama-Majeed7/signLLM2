@@ -13,8 +13,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from configs.config import Config
-from models.signllm_features import create_signllm_features_model
-from data.phoenix_features_dataset import PhoenixFeaturesDataset
+from models.signllm import create_signllm_features_model
+from data.phoenix_dataset import PhoenixFeaturesDataset
 
 def print_header(title):
     """Print formatted header"""
