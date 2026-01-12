@@ -1,42 +1,35 @@
 """
-Fixed SignLLM Model with correct dimensions
+SignLLM Model for I3D Features (instead of raw videos)
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class VQSign(nn.Module):
-    """Vector-Quantized Visual Sign Module - Fixed dimensions"""
+class VQSignFeatures(nn.Module):
+    """Vector-Quantized Visual Sign Module for I3D Features"""
     def __init__(self, config):
         super().__init__()
         self.config = config
         
-        # Calculate output dimensions after encoder
-        self.encoder_output_dim = self._calculate_encoder_output_dim()
+        # Input feature dimension
+        self.input_dim = config.feature_dim
         
-        # 3D CNN Encoder with proper dimensions
-        self.encoder = nn.Sequential(
-            # Conv Block 1
-            nn.Conv3d(3, 32, kernel_size=(3, 3, 3), padding=(1, 1, 1)),
-            nn.BatchNorm3d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2)),
-            
-            # Conv Block 2
-            nn.Conv3d(32, 64, kernel_size=(3, 3, 3), padding=(1, 1, 1)),
-            nn.BatchNorm3d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2)),
-            
-            # Conv Block 3
-            nn.Conv3d(64, 128, kernel_size=(3, 3, 3), padding=(1, 1, 1)),
-            nn.BatchNorm3d(128),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool3d((config.clip_frames, 4, 4))
+        # Feature processor (for temporal features)
+        self.feature_processor = nn.Sequential(
+            nn.Linear(self.input_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(512, config.codebook_dim),
+            nn.ReLU()
         )
         
-        # Projection to codebook dimension
-        self.projection = nn.Linear(self.encoder_output_dim, config.codebook_dim)
+        # Temporal convolution for sequence processing
+        self.temporal_conv = nn.Conv1d(
+            config.codebook_dim, 
+            config.codebook_dim, 
+            kernel_size=3, 
+            padding=1
+        )
         
         # Codebook
         self.codebook = nn.Embedding(config.codebook_size, config.codebook_dim)
@@ -50,54 +43,42 @@ class VQSign(nn.Module):
             num_layers=1
         )
     
-    def _calculate_encoder_output_dim(self):
-        """Calculate the output dimension of encoder"""
-        # After AdaptiveAvgPool3d((clip_frames, 4, 4)) with 128 channels
-        # Output shape will be: (batch, 128, clip_frames, 4, 4)
-        return 128 * self.config.clip_frames * 4 * 4
-    
-    def extract_features(self, x):
-        """Extract features from video"""
-        B, C, T, H, W = x.shape
+    def process_features(self, x):
+        """
+        Process input features
+        x shape: (B, C, T, D) or (B, D) or similar
+        Returns: (B, T, codebook_dim)
+        """
+        B = x.shape[0]
         
-        # Process as overlapping clips
-        num_clips = max(1, (T - self.config.clip_frames) // self.config.clip_stride + 1)
-        features = []
+        # Handle different input shapes
+        if x.dim() == 2:
+            # (B, D) -> single feature vector
+            x = x.unsqueeze(1)  # (B, 1, D)
         
-        for i in range(num_clips):
-            start = i * self.config.clip_stride
-            end = min(start + self.config.clip_frames, T)
-            
-            # Handle edge case
-            if end - start < self.config.clip_frames:
-                # Pad the last clip
-                padding = self.config.clip_frames - (end - start)
-                clip = torch.cat([
-                    x[:, :, start:end],
-                    x[:, :, -1:].repeat(1, 1, padding, 1, 1)
-                ], dim=2)
-            else:
-                clip = x[:, :, start:end]
-            
-            # Encode clip
-            feat = self.encoder(clip)
-            
-            # Flatten and project
-            feat = feat.view(B, -1)
-            feat = self.projection(feat)
-            features.append(feat)
+        # x is now (B, T, D) or (B, 1, D)
+        B, T, D = x.shape
         
-        # Stack: (B, num_clips, codebook_dim)
-        if features:
-            return torch.stack(features, dim=1)
-        else:
-            # Handle case when no clips can be extracted
-            dummy = torch.zeros(B, 1, self.config.codebook_dim, device=x.device)
-            return dummy
+        # Process each temporal step
+        processed = []
+        for t in range(T):
+            feature_slice = x[:, t, :]  # (B, D)
+            processed_slice = self.feature_processor(feature_slice)  # (B, codebook_dim)
+            processed.append(processed_slice)
+        
+        # Stack: (B, T, codebook_dim)
+        features = torch.stack(processed, dim=1)
+        
+        # Apply temporal convolution
+        features = features.permute(0, 2, 1)  # (B, codebook_dim, T)
+        features = self.temporal_conv(features)
+        features = features.permute(0, 2, 1)  # (B, T, codebook_dim)
+        
+        return features
     
     def quantize(self, features):
         """Quantize features using codebook"""
-        B, L, D = features.shape
+        B, T, D = features.shape
         
         # Reshape for quantization
         flat_features = features.reshape(-1, D)
@@ -105,14 +86,14 @@ class VQSign(nn.Module):
         # Find nearest codebook entries
         distances = torch.cdist(flat_features, self.codebook.weight)
         token_indices = torch.argmin(distances, dim=-1)
-        quantized = self.codebook(token_indices).view(B, L, D)
+        quantized = self.codebook(token_indices).view(B, T, D)
         
-        return token_indices.view(B, L), quantized
+        return token_indices.view(B, T), quantized
     
     def forward(self, x):
         """Forward pass"""
-        # Extract features
-        features = self.extract_features(x)
+        # Process features
+        features = self.process_features(x)
         
         # Quantize
         token_indices, quantized = self.quantize(features)
@@ -121,7 +102,7 @@ class VQSign(nn.Module):
         commitment_loss = F.mse_loss(features, quantized.detach())
         codebook_loss = F.mse_loss(quantized, features.detach())
         
-        # Context prediction loss (simplified)
+        # Context prediction loss
         context_loss = torch.tensor(0.0, device=x.device)
         if features.shape[1] > 1:
             context_features, _ = self.context_predictor(quantized[:, :-1])
@@ -136,15 +117,14 @@ class VQSign(nn.Module):
         
         return token_indices, quantized, losses
 
-class SimpleCRA(nn.Module):
-    """Simplified Codebook Reconstruction and Alignment"""
+class SimpleCRAFeatures(nn.Module):
+    """Codebook Reconstruction and Alignment for Features"""
     def __init__(self, config, char_codebook):
         super().__init__()
         self.config = config
-        self.char_codebook = char_codebook
         
-        # Word codebook (smaller than character codebook)
-        word_size = max(32, config.codebook_size // 8)  # Minimum 32 words
+        # Word codebook
+        word_size = max(32, config.codebook_size // 8)
         self.word_codebook = nn.Embedding(word_size, config.codebook_dim)
         nn.init.uniform_(self.word_codebook.weight, -1.0/word_size, 1.0/word_size)
         
@@ -152,11 +132,9 @@ class SimpleCRA(nn.Module):
         self.alignment_proj = nn.Linear(config.codebook_dim, config.codebook_dim)
     
     def group_characters(self, char_tokens, char_embeddings):
-        """Group characters into words"""
-        B, L, D = char_embeddings.shape
+        """Group character tokens into word tokens"""
+        B, T, D = char_embeddings.shape
         
-        # Simple fixed grouping: every 2 characters = 1 word
-        word_length = 2
         word_embeddings = []
         word_indices = []
         
@@ -164,19 +142,19 @@ class SimpleCRA(nn.Module):
             words_b = []
             indices_b = []
             
-            for i in range(0, L, word_length):
-                if i + word_length <= L:
-                    # Average character embeddings
+            # Simple grouping: every 2 time steps = 1 word
+            word_length = 2
+            for i in range(0, T, word_length):
+                if i + word_length <= T:
                     char_group = char_embeddings[b, i:i+word_length]
                     word_emb = char_group.mean(dim=0)
                     
-                    # Find nearest word in codebook
                     distances = torch.cdist(word_emb.unsqueeze(0), self.word_codebook.weight)
                     word_idx = torch.argmin(distances)
                     
                     words_b.append(self.word_codebook(word_idx))
                     indices_b.append(word_idx.item())
-                elif i < L:  # Handle leftover characters
+                elif i < T:  # Handle leftover
                     word_emb = char_embeddings[b, i:i+1].mean(dim=0)
                     distances = torch.cdist(word_emb.unsqueeze(0), self.word_codebook.weight)
                     word_idx = torch.argmin(distances)
@@ -196,10 +174,8 @@ class SimpleCRA(nn.Module):
         """Forward pass"""
         word_indices, word_embeddings = self.group_characters(char_tokens, char_embeddings)
         
-        # Alignment loss (simplified)
         alignment_loss = torch.tensor(0.0, device=char_embeddings.device)
         
-        # Project for alignment
         if word_embeddings and len(word_embeddings[0]) > 0:
             all_word_embs = torch.cat(word_embeddings)
             projected = self.alignment_proj(all_word_embs)
@@ -207,9 +183,9 @@ class SimpleCRA(nn.Module):
         
         return word_indices, word_embeddings, {'alignment_loss': alignment_loss}
 
-class TextDecoder(nn.Module):
-    """Simple text decoder"""
-    def __init__(self, input_dim, vocab_size=3000):
+class TextDecoderFeatures(nn.Module):
+    """Text decoder for features"""
+    def __init__(self, input_dim, vocab_size=5000):
         super().__init__()
         self.decoder = nn.Sequential(
             nn.Linear(input_dim, 512),
@@ -220,49 +196,48 @@ class TextDecoder(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(1024, vocab_size)
         )
-        
+    
     def forward(self, x):
         return self.decoder(x)
 
-class SignLLM(nn.Module):
-    """Complete SignLLM Model - Fixed"""
+class SignLLMFeatures(nn.Module):
+    """Complete SignLLM Model for I3D Features"""
     def __init__(self, config):
         super().__init__()
         self.config = config
         
         # Modules
-        self.vq_sign = VQSign(config)
-        self.cra = SimpleCRA(config, self.vq_sign.codebook)
+        self.vq_sign = VQSignFeatures(config)
+        self.cra = SimpleCRAFeatures(config, self.vq_sign.codebook)
         
         # Text decoder
-        vocab_size = 3000  # Phoenix has ~2887 German words
-        self.text_decoder = TextDecoder(config.codebook_dim, vocab_size)
+        vocab_size = 5000  # Adjust based on your dataset
+        self.text_decoder = TextDecoderFeatures(config.codebook_dim, vocab_size)
         
         # Loss weights
         self.lambda_mmd = config.lambda_mmd
         self.lambda_sim = config.lambda_sim
     
-    def forward(self, videos, texts=None):
+    def forward(self, features, texts=None):
         """
         Forward pass
-        videos: (B, C, T, H, W)
-        texts: list of strings (optional)
+        features: Input features (B, ...)
+        texts: Optional texts for training
         """
-        B = videos.shape[0]
+        B = features.shape[0]
         
-        # VQ-Sign: Video -> Character tokens
-        char_tokens, char_embeddings, vq_losses = self.vq_sign(videos)
+        # VQ-Sign: Features -> Character tokens
+        char_tokens, char_embeddings, vq_losses = self.vq_sign(features)
         
         # CRA: Character -> Word tokens
         word_indices, word_embeddings, cra_losses = self.cra(char_tokens, char_embeddings)
         
         # Text generation loss
-        translation_loss = torch.tensor(0.0, device=videos.device)
+        translation_loss = torch.tensor(0.0, device=features.device)
         
         if texts is not None:
-            # Simple dummy translation loss for now
-            # In a real implementation, you would use a tokenizer and compute proper loss
-            translation_loss = torch.tensor(0.1, device=videos.device) * B
+            # Simple translation loss (you can implement proper loss here)
+            translation_loss = torch.tensor(0.1, device=features.device) * B
         
         # Combine losses
         total_loss = (
@@ -280,10 +255,10 @@ class SignLLM(nn.Module):
         
         return word_indices, losses
 
-# Helper function to create model
-def create_signllm_model(config):
-    """Create and initialize SignLLM model"""
-    model = SignLLM(config)
+# Helper function
+def create_signllm_features_model(config):
+    """Create and initialize SignLLM model for features"""
+    model = SignLLMFeatures(config)
     
     # Initialize weights
     def init_weights(m):
@@ -291,7 +266,7 @@ def create_signllm_model(config):
             nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.Conv3d):
+        elif isinstance(m, nn.Conv1d):
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
